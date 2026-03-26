@@ -1,7 +1,7 @@
 {
   "name": "Wireframe2Code",
   "version": "1.0.0",
-  "description": "Your Figma Plugin",
+  "description": "Bidirectional Figma plugin for converting wireframes to code and vice versa",
   "main": "code.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
