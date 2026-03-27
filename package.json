@@ -1,5 +1,5 @@
 {
-  "name": "Wireframe2Code",
+  "name": "Blueprint2Code",
   "version": "1.0.0",
   "description": "Bidirectional Figma plugin for converting wireframes to code and vice versa",
   "main": "code.js",

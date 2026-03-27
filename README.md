@@ -1,6 +1,6 @@
 <<<<<<< HEAD
-# Wireframe2Code
-Wireframe2Code
+# Blueprint2Code
+Blueprint2Code
 =======
 Below are the steps to get your plugin running. You can also find instructions at:
 
