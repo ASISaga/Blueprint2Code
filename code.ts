@@ -1,6 +1,13 @@
 // Wireframe2Code — bidirectional sync between blueprint JSON files and Figma nodes.
 // Main thread: has access to the Figma document API.
 // UI thread (ui.html): has access to browser APIs (FileReader, Blob, etc.).
+//
+// Genesis Design System integration: blueprints exported from theme.asisaga.com's
+// _design/ directory carry a "figmaStyles" block computed from the ontological
+// layout-variant by blueprint-sync-figma.sh. This file reads that block and applies
+// fills, strokes, effects, corner-radius, opacity, and typography to every node
+// on import. On export the figmaStyles are included in the JSON so that the
+// round-trip _design/ → Figma → _design/ is lossless.
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -10,6 +17,8 @@ const DEFAULT_FONT: FontName = { family: 'Inter', style: 'Regular' };
 
 figma.showUI(__html__, { width: 340, height: 500 });
 
+// ─── Types ────────────────────────────────────────────────────────────────────
+
 type BlueprintNodeType = 'FRAME' | 'COMPONENT' | 'INSTANCE' | 'TEXT' | 'GROUP';
 type LayoutModeValue = 'VERTICAL' | 'HORIZONTAL' | 'GRID' | 'NONE';
 
@@ -18,6 +27,88 @@ interface AsiSagaMetadata {
   'motion-intent': string;
   'layout-variant': string;
 }
+
+// ── Figma visual styles (computed by blueprint-sync-figma.sh) ─────────────────
+
+interface FigmaColor {
+  r: number;  // 0–1
+  g: number;
+  b: number;
+}
+
+interface FigmaColorWithAlpha extends FigmaColor {
+  a: number;
+}
+
+interface SolidPaint {
+  type: 'SOLID';
+  color: FigmaColor;
+  opacity?: number;
+}
+
+interface GradientStop {
+  color: FigmaColorWithAlpha;
+  position: number;  // 0–1
+}
+
+interface GradientPaint {
+  type: 'GRADIENT_LINEAR' | 'GRADIENT_RADIAL';
+  gradientStops: GradientStop[];
+  gradientTransform: number[][];
+}
+
+type FigmaPaint = SolidPaint | GradientPaint;
+
+interface FigmaDropShadowEffect {
+  type: 'DROP_SHADOW' | 'INNER_SHADOW';
+  color: FigmaColorWithAlpha;
+  offset: { x: number; y: number };
+  radius: number;
+  spread: number;
+  visible: boolean;
+  blendMode: string;
+}
+
+interface FigmaLayerBlurEffect {
+  type: 'LAYER_BLUR';
+  radius: number;
+  visible: boolean;
+}
+
+type FigmaEffect = FigmaDropShadowEffect | FigmaLayerBlurEffect;
+
+interface FigmaTypography {
+  fontSize?: number;
+  fontWeight?: number;
+  lineHeight?: { value: number; unit: 'PERCENT' | 'PIXELS' | 'AUTO' };
+  letterSpacing?: { value: number; unit: 'PERCENT' | 'PIXELS' };
+  textColor?: FigmaColor;
+  textTransform?: 'UPPER' | 'LOWER' | 'TITLE' | 'ORIGINAL';
+  fontFamily?: string;
+  fontStyle?: string;
+}
+
+interface FigmaLayoutHint {
+  layoutMode?: 'VERTICAL' | 'HORIZONTAL' | 'NONE';
+  primaryAxisSizingMode?: 'AUTO' | 'FIXED';
+  counterAxisSizingMode?: 'AUTO' | 'FIXED';
+  layoutWrap?: 'NO_WRAP' | 'WRAP';
+  maxWidth?: number;
+}
+
+interface NodeFigmaStyles {
+  fills?: FigmaPaint[];
+  strokes?: FigmaPaint[];
+  strokeWeight?: number;
+  cornerRadius?: number;
+  opacity?: number;
+  effects?: FigmaEffect[];
+  typography?: FigmaTypography;
+  layoutHint?: FigmaLayoutHint;
+  clipsContent?: boolean;
+}
+
+// ── Core blueprint interfaces ─────────────────────────────────────────────────
 
 interface BlueprintNode {
   id: string;
@@ -30,6 +121,7 @@ interface BlueprintNode {
   attributes?: Record<string, string>;
   ref?: string;
   children?: BlueprintNode[];
+  figmaStyles?: NodeFigmaStyles;  // Visual styles from Genesis ontological variant
 }
 
 interface BlueprintFile extends BlueprintNode {
@@ -197,6 +289,151 @@ async function applyBlueprintData(
     await figma.loadFontAsync(DEFAULT_FONT);
     (node as TextNode).characters = data.content;
   }
+
+  // Persist figmaStyles as plugin data for round-trip export fidelity
+  if (data.figmaStyles !== undefined) {
+    node.setPluginData('figmaStyles', JSON.stringify(data.figmaStyles));
+  }
+
+  // Apply Genesis visual styles to the Figma node
+  if (data.figmaStyles) {
+    await applyFigmaStyles(node, data.figmaStyles);
+  }
+}
+
+/**
+ * Apply figmaStyles from an enriched blueprint node to a Figma scene node.
+ * Called after structural properties are set so it can override defaults.
+ */
+async function applyFigmaStyles(
+  node: SceneNode,
+  styles: NodeFigmaStyles,
+): Promise<void> {
+  // ── Fills ─────────────────────────────────────────────────────────────────
+  if (styles.fills !== undefined && node.type !== 'TEXT') {
+    if ('fills' in node) {
+      (node as GeometryMixin).fills = styles.fills.map(paint => {
+        if (paint.type === 'SOLID') {
+          return {
+            type: 'SOLID',
+            color: paint.color,
+            opacity: (paint as SolidPaint).opacity ?? 1,
+          } as Paint;
+        }
+        if (paint.type === 'GRADIENT_LINEAR' || paint.type === 'GRADIENT_RADIAL') {
+          const gp = paint as GradientPaint;
+          return {
+            type: paint.type,
+            gradientTransform: gp.gradientTransform as Transform,
+            gradientStops: gp.gradientStops.map(stop => ({
+              color: stop.color,
+              position: stop.position,
+            })),
+          } as Paint;
+        }
+        return paint as unknown as Paint;
+      });
+    }
+  }
+
+  // ── Strokes ───────────────────────────────────────────────────────────────
+  if (styles.strokes !== undefined && 'strokes' in node) {
+    (node as GeometryMixin).strokes = styles.strokes.map(paint => ({
+      type: 'SOLID',
+      color: (paint as SolidPaint).color,
+      opacity: (paint as SolidPaint).opacity ?? 1,
+    })) as Paint[];
+
+    if (styles.strokeWeight !== undefined && 'strokeWeight' in node) {
+      (node as GeometryMixin).strokeWeight = styles.strokeWeight;
+    }
+  }
+
+  // ── Corner radius ─────────────────────────────────────────────────────────
+  if (styles.cornerRadius !== undefined && node.type === 'FRAME') {
+    (node as FrameNode).cornerRadius = styles.cornerRadius;
+  }
+
+  // ── Opacity ───────────────────────────────────────────────────────────────
+  if (styles.opacity !== undefined && 'opacity' in node) {
+    (node as BlendMixin).opacity = styles.opacity;
+  }
+
+  // ── Effects ───────────────────────────────────────────────────────────────
+  if (styles.effects !== undefined && 'effects' in node) {
+    (node as BlendMixin).effects = styles.effects.map(effect => {
+      if (effect.type === 'LAYER_BLUR') {
+        return {
+          type: 'LAYER_BLUR',
+          radius: effect.radius,
+          visible: effect.visible,
+        } as Effect;
+      }
+      // DROP_SHADOW / INNER_SHADOW
+      const se = effect as FigmaDropShadowEffect;
+      return {
+        type: se.type === 'INNER_SHADOW' ? 'INNER_SHADOW' : 'DROP_SHADOW',
+        color: se.color,
+        offset: se.offset,
+        radius: se.radius,
+        spread: se.spread,
+        visible: se.visible,
+        blendMode: se.blendMode as BlendMode,
+      } as Effect;
+    });
+  }
+
+  // ── clipsContent ─────────────────────────────────────────────────────────
+  if (styles.clipsContent !== undefined && node.type === 'FRAME') {
+    (node as FrameNode).clipsContent = styles.clipsContent;
+  }
+
+  // ── AutoLayout hints from environment variants ────────────────────────────
+  if (styles.layoutHint && node.type === 'FRAME') {
+    const frame = node as FrameNode;
+    const hint  = styles.layoutHint;
+    if (hint.layoutMode) {
+      frame.layoutMode = hint.layoutMode;
+    }
+    if (hint.primaryAxisSizingMode) {
+      frame.primaryAxisSizingMode = hint.primaryAxisSizingMode as 'AUTO' | 'FIXED';
+    }
+    if (hint.counterAxisSizingMode) {
+      frame.counterAxisSizingMode = hint.counterAxisSizingMode as 'AUTO' | 'FIXED';
+    }
+    if (hint.layoutWrap && 'layoutWrap' in frame) {
+      (frame as FrameNode & { layoutWrap: string }).layoutWrap = hint.layoutWrap;
+    }
+  }
+
+  // ── Typography ────────────────────────────────────────────────────────────
+  if (styles.typography && node.type === 'TEXT') {
+    const textNode = node as TextNode;
+    const typo     = styles.typography;
+
+    const fontName: FontName = {
+      family: typo.fontFamily ?? 'Inter',
+      style:  typo.fontStyle  ?? 'Regular',
+    };
+    try {
+      await figma.loadFontAsync(fontName);
+      textNode.fontName = fontName;
+    } catch {
+      // Fallback to Inter Regular if the specified font is not available
+      await figma.loadFontAsync({ family: 'Inter', style: 'Regular' });
+      textNode.fontName = { family: 'Inter', style: 'Regular' };
+    }
+
+    if (typo.fontSize)      textNode.fontSize      = typo.fontSize;
+    if (typo.fontWeight)    textNode.fontWeight    = typo.fontWeight;
+    if (typo.lineHeight)    textNode.lineHeight    = typo.lineHeight as LineHeight;
+    if (typo.letterSpacing) textNode.letterSpacing = typo.letterSpacing as LetterSpacing;
+    if (typo.textTransform) textNode.textCase      = typo.textTransform as TextCase;
+
+    if (typo.textColor && 'fills' in textNode) {
+      textNode.fills = [{ type: 'SOLID', color: typo.textColor, opacity: 1 }];
+    }
+  }
 }
 
 /** Sync the Figma children of `parent` to match `childrenData`. */
@@ -299,6 +536,15 @@ function exportBlueprintNode(node: SceneNode): BlueprintNode {
   // Ref
   const ref = node.getPluginData('blueprintRef');
   if (ref) result.ref = ref;
+
+  // figmaStyles — preserved from plugin data for round-trip fidelity
+  // This ensures _design/ blueprints exported from Figma include the visual styles.
+  const figmaStylesRaw = node.getPluginData('figmaStyles');
+  if (figmaStylesRaw) {
+    try {
+      result.figmaStyles = JSON.parse(figmaStylesRaw) as NodeFigmaStyles;
+    } catch { /* skip malformed data */ }
+  }
 
   // Children
   if (isContainerNode(node) && node.children.length > 0) {
